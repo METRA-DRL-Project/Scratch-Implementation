@@ -53,6 +53,7 @@ def cleanup_memory():
         torch.cuda.empty_cache()            # Release cached GPU memory (PyTorch only)
         torch.cuda.ipc_collect()            # Clean up interprocess memory (multi-GPU safe)
 
+import warnings
 
 # @title Define Replay Buffer
 class ReplayBuffer:
@@ -65,8 +66,28 @@ class ReplayBuffer:
         self.buffer.extend(transitions)
 
     def sample(self):
-        batch = random.sample(self.buffer, self.batch_size)
+        if len(self.buffer) < self.batch_size:
+            batch = random.choices(self.buffer, k=self.batch_size)
+            warnings.warn(f"Requested batch size {self.batch_size} is larger than buffer size \
+                 {len(self.buffer)}. Sampling with replacement.", category=UserWarning)
+
+        else:
+            batch = random.sample(self.buffer, self.batch_size)
+
         return [torch.stack(e).to(device) for e in zip(*batch)]  # state, skill, action, reward, next_state, not_done
+
+    def sample_by_skill(self, skill_id, num_samples=128): ## THIS METHOD ASSUMES ONE HOT ENCODED SKILLS
+        filtered = [transition for transition in self.buffer
+                    if torch.argmax(transition[1]).item() == skill_id]
+
+        if len(filtered) < num_samples:
+            batch = filtered
+            warnings.warn(f"Not enough samples for skill {skill_id}. Sampling with replacement.", category=UserWarning)
+        else:
+            batch = random.sample(filtered, num_samples)
+
+        return [torch.stack(e).to(device) for e in zip(*batch)]
+
 
     def __len__(self):
         return len(self.buffer)
@@ -81,34 +102,67 @@ class DRL:
 
         self.replay_buffer = ReplayBuffer(capacity=buffer_size)
 
-    def rollout(self, agent, i, n_skill, encoder):
-        """Collect experience and store it in the replay buffer"""
+    # def rollout(self, agent, i, n_skill, encoder):
+    #     """Collect experience and store it in the replay buffer"""
 
+    #     obs, _ = self.envs.reset()
+    #     # obs = torch.tensor(obs, dtype=torch.float32, device=device).view(obs.shape[0], -1) ## CURRENTLY JUST FLATTENING, BUT CAN POTENTIALLY USE CNN TO EXTRACT FEATURES
+    #     obs = torch.tensor(obs, dtype=torch.float32, device=device).permute(0, 3, 1, 2)
+    #     enc_obs = encoder(obs)
+
+    #     # Sample a skill per environment (shape: [n_envs, skill_dim]) 
+    #     # skills = torch.rand(self.n_envs, n_skill, device=device)
+
+    #     ## SAMPLE ONLY ONE SKILL PER ENVIRONMENT
+    #     skills = torch.eye(n_skill)[torch.randint(0, n_skill, (self.n_envs,))].to(device) # One hot encoded skills
+
+    #     total_rewards = torch.zeros(self.n_envs, device=device)
+
+    #     for _ in range(self.n_steps):
+    #         with torch.no_grad():
+    #             actions = agent.get_action(enc_obs, skills)
+
+    #         next_obs, rewards, dones, truncateds, _ = self.envs.step(actions.cpu().numpy())
+    #         next_obs = torch.tensor(next_obs, dtype=torch.float32, device=device).permute(0, 3, 1, 2)
+    #         rewards = torch.tensor(rewards, dtype=torch.float32, device=device)
+    #         not_done = ~(dones | truncateds)
+
+    #         self.replay_buffer.store(obs, skills, actions, rewards, next_obs, not_done) ### SO THE REPLAY BUFFER STORE 4 experiences 
+    #         obs = next_obs
+    #         total_rewards += rewards
+
+    #     writer.add_scalar("stats/Rewards", total_rewards.mean().item() / self.n_steps, i)
+
+    def rollout(self, agent, i, n_skill, encoder):
         obs, _ = self.envs.reset()
-        # obs = torch.tensor(obs, dtype=torch.float32, device=device).view(obs.shape[0], -1) ## CURRENTLY JUST FLATTENING, BUT CAN POTENTIALLY USE CNN TO EXTRACT FEATURES
         obs = torch.tensor(obs, dtype=torch.float32, device=device).permute(0, 3, 1, 2)
         enc_obs = encoder(obs)
 
-        # Sample a skill per environment (shape: [n_envs, skill_dim]) 
-        # skills = torch.rand(self.n_envs, n_skill, device=device)
-
-        ## SAMPLE ONLY ONE SKILL PER ENVIRONMENT
-        skills = torch.eye(n_skill)[torch.randint(0, n_skill, (self.n_envs,))].to(device) # One hot encoded skills
-
+        # Initialize skill vector for each environment
+        # env_skills = torch.eye(n_skill)[torch.randint(0, n_skill, (self.n_envs,))].to(device)  # shape: (n_envs, n_skill)
+        env_skills = F.normalize(torch.randn(self.n_envs, n_skill, device=device), dim=1)  # shape: (n_envs, n_skill)
         total_rewards = torch.zeros(self.n_envs, device=device)
 
-        for _ in range(self.n_steps):
+        for step_num in range(self.n_steps):
             with torch.no_grad():
-                actions = agent.get_action(enc_obs, skills)
+                actions = agent.get_action(enc_obs, env_skills)
 
             next_obs, rewards, dones, truncateds, _ = self.envs.step(actions.cpu().numpy())
             next_obs = torch.tensor(next_obs, dtype=torch.float32, device=device).permute(0, 3, 1, 2)
             rewards = torch.tensor(rewards, dtype=torch.float32, device=device)
             not_done = ~(dones | truncateds)
 
-            self.replay_buffer.store(obs, skills, actions, rewards, next_obs, not_done) ### SO THE REPLAY BUFFER STORE 4 experiences 
+            # Store the transitions
+            self.replay_buffer.store(obs, env_skills, actions, rewards, next_obs, not_done)
             obs = next_obs
+            enc_obs = encoder(obs)
             total_rewards += rewards
+
+            # Resample skills only for environments where episode ended
+            done_mask = dones | truncateds
+            if done_mask.any() or step_num % 50 == 0: ## RESAMPLING SKILLS QUITE A LOT :)
+                new_skills = F.normalize(torch.randn(done_mask.sum(), n_skill, device=device), dim=1)
+                env_skills[done_mask] = new_skills
 
         writer.add_scalar("stats/Rewards", total_rewards.mean().item() / self.n_steps, i)
 
@@ -127,10 +181,11 @@ def encode_state(state, encoder):
 
 
 class SkillPolicy:
-    def __init__(self, n_obs, n_skills, n_actions, encoder):
-        self.alpha = 0.1
+    def __init__(self, n_obs, n_skills, n_actions, representation):
+        self.alpha = 1.5
         self.n_actions = n_actions
-        self.encoder = encoder
+        self.encoder = representation.encoder
+        self.representation = representation
 
         self.q1_net = nn.Sequential(
             nn.Linear(n_obs + n_skills, 256),
@@ -154,9 +209,9 @@ class SkillPolicy:
         self.q2_target_net = copy.deepcopy(self.q1_net).to(device)
 
         self.q_optimizer = Adam(
-            list(self.q1_net.parameters()) + list(self.q2_net.parameters()), lr=3e-4
+            list(self.q1_net.parameters()) + list(self.q2_net.parameters()), lr=1e-4
         )
-        self.policy_optimizer = Adam(self.policy.parameters(), lr=3e-4)
+        self.policy_optimizer = Adam(self.policy.parameters(), lr=1e-4)
         self.gamma = 0.99
 
     def get_policy_distribution(self, states, skills):
@@ -177,18 +232,26 @@ class SkillPolicy:
 
     def get_q_loss(self, states, actions, rewards, next_states, not_dones, skills):
         with torch.no_grad():
-            intrinsic_reward = torch.einsum('bi,bi->b', \
-                (representation.get_latent_representation(next_states) -\
-                     representation.get_latent_representation(states)), skills).unsqueeze(-1)
+            phi = self.representation.get_latent_representation(states)
+            phi_next = self.representation.get_latent_representation(next_states)
+
+            delta_phi = phi - phi_next
+            # skills = F.normalize(skills, p=2, dim=1)
+
+            intrinsic_reward = torch.einsum('bi,bi->b', delta_phi, skills).unsqueeze(-1)
+            intrinsic_reward = torch.clamp(intrinsic_reward, -10, 10)
             
             next_states = encode_state(next_states, self.encoder)
             next_input = torch.cat([next_states, skills], dim=-1)
             next_q1 = self.q1_target_net(next_input)
             next_q2 = self.q2_target_net(next_input)
             next_q = torch.min(next_q1, next_q2)
-            next_pi = policy.get_policy_distribution(next_states, skills)
-            next_entropy = next_pi.entropy().unsqueeze(-1)
-            next_q_val = (next_pi.probs * (next_q - self.alpha * next_entropy)).sum(dim=-1, keepdim=True)
+
+            next_pi = self.get_policy_distribution(next_states, skills)
+            log_probs = next_pi.logits.log_softmax(dim=-1)
+            # next_entropy = next_pi.entropy().unsqueeze(-1)
+            # next_entropy = next_pi.logits.log_softmax(dim=-1)
+            next_q_val = (next_pi.probs * (next_q - self.alpha * log_probs)).sum(dim=-1, keepdim=True)
             q_target = intrinsic_reward + self.gamma * not_dones * next_q_val
 
         states = encode_state(states, self.encoder)
@@ -279,15 +342,17 @@ class RepresentationFunction(nn.Module):
         ).to(device)
 
         self.encoder = CNNEncoder(out_dim=256)
-        self.optimizer = Adam(list(self.parameters()) + list(self.encoder.parameters()), lr=3e-4)
-        self.lambda_param = torch.tensor(1.0, requires_grad=True)
-        self.lambda_optimizer = Adam([self.lambda_param], lr=3e-4)
-        self.epsilon = 0.1
+        self.optimizer = Adam(list(self.parameters()) + list(self.encoder.parameters()), lr=1e-4)
+        self.lambda_param = torch.tensor(0.05, requires_grad=True)
+        self.lambda_optimizer = Adam([self.lambda_param], lr=1e-4)
+        self.epsilon = 1.0
 
-    def get_latent_representation(self, state):
+    def get_latent_representation(self, state, normalize=False):
         features = encode_state(state, self.encoder)
         x = self.representation_func(features)
-        return F.normalize(x, p=2, dim=1)
+        if normalize:
+            return F.normalize(x, p=2, dim=1)
+        return x
 
     def update(self, replay_buffer, i):
         """
@@ -312,7 +377,7 @@ class RepresentationFunction(nn.Module):
           )
 
           # Representation loss
-          representation_loss = (consistency_term + self.lambda_param.detach() * penalty_term).mean()
+          representation_loss = (consistency_term + self.lambda_param * penalty_term).mean()
 
           # Lambda loss (only on penalty term)
           lambda_loss = (self.lambda_param * penalty_term.detach()).mean()
@@ -329,28 +394,6 @@ class RepresentationFunction(nn.Module):
 
         writer.add_scalar("loss/representation_loss", representation_loss.item(), i)
         writer.add_scalar("loss/  lambda_loss", lambda_loss.item(), i)
-
-
-def visualize_representation(replay_buffer, representation, n_samples=1000, folder='.'):
-    states, skills, *_ = replay_buffer.sample()
-    states = states[:n_samples]
-    skills = skills[:n_samples]
-    with torch.no_grad():
-        phis = representation.get_latent_representation(states).cpu().numpy()
-        skills_np = skills.argmax(dim=1).cpu().numpy()
-
-    tsne = TSNE(n_components=2, perplexity=10)
-    tsne_result = tsne.fit_transform(phis)
-
-    plt.figure(figsize=(8, 6))
-    for skill in np.unique(skills_np):
-        idx = skills_np == skill
-        plt.scatter(tsne_result[idx, 0], tsne_result[idx, 1], label=f'Skill {skill}', alpha=0.6)
-    plt.legend()
-    plt.title('t-SNE of Representation φ(s)')
-    plt.savefig(f"{folder}/representation_tsne.png")
-    plt.close()
-
 
 
 def compute_heatmap(frames, save_path):
@@ -370,18 +413,53 @@ def compute_heatmap(frames, save_path):
     plt.savefig(save_path, bbox_inches='tight', pad_inches=0)
     plt.close()
 
+def visualize_representation(replay_buffer, representation, n_samples=1000, folder='.', n_skills=10):
+    skill_data = []
+    for skill_id in range(n_skills):
+        samples = replay_buffer.sample_by_skill(skill_id, num_samples=max(int(n_samples/10), 100))
+        skill_data.append(samples)
+
+    # Combine all samples
+    states = torch.cat([s[0] for s in skill_data], dim=0)
+    skills = torch.cat([s[1] for s in skill_data], dim=0)
+
+    with torch.no_grad():
+        skill_ids = torch.argmax(skills, dim=1)  # assume Gaussian skills aren't passed here!
+
+        phis = representation.get_latent_representation(states).cpu().numpy()
+        skill_ids_np = skill_ids.cpu().numpy()
+
+    tsne = TSNE(n_components=2, perplexity=10)
+    tsne_result = tsne.fit_transform(phis)
+
+    plt.figure(figsize=(8, 6))
+    for skill_id in range(n_skills):
+        idx = skill_ids_np == skill_id
+        if np.sum(idx) == 0:
+            continue
+        plt.scatter(tsne_result[idx, 0], tsne_result[idx, 1], label=f'Skill {skill_id}', alpha=0.6)
+    plt.legend()
+    plt.title('t-SNE of Representation φ(s)')
+    plt.savefig(f"{folder}/representation_tsne.png")
+    plt.close()
+
 
 def evaluate_skills(env_name, policy, representation, global_step, writer=None, n_skills=5, steps_per_skill=512, video_dir='skill_videos'):
     os.makedirs(video_dir, exist_ok=True)
 
-    for skill_id in range(min(5, n_skills)): # For every z vector, I will perform ONLY the action related to that skill and get the reward
+    temp_buffer = ReplayBuffer(capacity=steps_per_skill * n_skills)
+    temp_buffer.batch_size = 512
+
+    for skill_id in range(n_skills): # For every z vector, I will perform ONLY the action related to that skill and get the reward
         env = gym.make(env_name, render_mode='rgb_array')
         obs, _ = env.reset()
         # obs = torch.tensor(obs, dtype=torch.float32, device=device).view(1, -1) ## NO need to flatten CNN encoder in representation function will handle it
         obs = torch.unsqueeze(torch.tensor(obs, dtype=torch.float32, device=device), 0).permute(0, 3, 1, 2)
 
+        # USING ONE HOT ENCODED SKILLS HERE SO THAT WE CAN FIND THE DIFFERENT SKILLS SEPARATELY
         skill = torch.zeros(1, n_skills, device=device)
-        skill[0, skill_id] = 1.0
+        skill[0, skill_id] = 1.0  # One-hot vector for evaluation
+
 
         frames = []
         total_intrinsic_reward = 0
@@ -398,6 +476,7 @@ def evaluate_skills(env_name, policy, representation, global_step, writer=None, 
             next_obs_tensor = torch.unsqueeze(torch.tensor(next_obs, dtype=torch.float32, device=device), 0).permute(0, 3, 1, 2) ## Encoding doesn't matter because get_latent_representation encodes
             delta_phi = representation.get_latent_representation(next_obs_tensor) - representation.get_latent_representation(obs)
             intrinsic_reward = torch.einsum('bi,bi->b', delta_phi, skill).item()
+            temp_buffer.store(obs, skill, torch.tensor([action]), torch.tensor([intrinsic_reward]), next_obs_tensor, torch.tensor([~(terminated or truncated)]))
             total_intrinsic_reward += intrinsic_reward
 
             if terminated or truncated:
@@ -411,16 +490,20 @@ def evaluate_skills(env_name, policy, representation, global_step, writer=None, 
         video_path = os.path.join(video_dir, f"skill_{skill_id}.mp4")
         imageio.mimsave(video_path, frames, fps=30)
 
+        writer.add_scalar("representation/mean_delta_phi_norm", delta_phi.norm(dim=1).item(), global_step)
+
         heatmap_path = os.path.join(video_dir, f"skill_{skill_id}_heatmap.png")
-        compute_heatmap(frames, heatmap_path)
+        # compute_heatmap(frames, heatmap_path)
 
         del frames
         torch.cuda.empty_cache()  
-
         # print(f"Skill {skill_id}: steps = {step_count}, intrinsic reward = {total_intrinsic_reward:.2f}, saved to {video_path}")
         if writer:
             writer.add_scalar(f"eval/intrinsic_reward_skill_{skill_id}", total_intrinsic_reward, global_step)
             writer.add_scalar(f"eval/episode_length_skill_{skill_id}", step_count, global_step)
+    
+    visualize_representation(temp_buffer, representation, folder=video_dir, n_skills=n_skills)
+
 
 if __name__ == "__main__":
     env = gym.make('ALE/MsPacman-v5')
@@ -430,7 +513,7 @@ if __name__ == "__main__":
     n_skill = 10 # 0 - NOOP, 1 - UP, 2 - LEFT, 3 - RIGHT, 4 - DOWN
 
     representation = RepresentationFunction(n_obs, n_skill)
-    policy = SkillPolicy(n_obs, n_skill, n_actions, representation.encoder)
+    policy = SkillPolicy(n_obs, n_skill, n_actions, representation)
 
     start_epoch = 0
 
@@ -476,8 +559,8 @@ if __name__ == "__main__":
                  epoch, writer=writer, n_skills=n_skill, video_dir=f'{folder}/video_eval_{epoch}') ## ONLY doing for the first 3 skills
 
             ## EVALUATING REPRESENTATION FUNCTION
-            visualize_representation(replay_buffer=drl.replay_buffer,\
-                 representation=representation, folder=f"{folder}/video_eval_{epoch}")
+            # visualize_representation(replay_buffer=drl.replay_buffer,\
+            #      representation=representation, folder=f"{folder}/video_eval_{epoch}") ## DOING THIS IN SkILL EVALUATION WHICH DOES ONE HOT ENCODED SKILLS
             # writer.add_image("eval/tSNE", \
             #      torch.tensor(np.array(Image.open(f"{folder}/video_eval_{epoch}/representation_tsne.png"))).permute(2, 0, 1), epoch)
 
