@@ -18,6 +18,7 @@ import cv2
 import matplotlib.pyplot as plt
 import imageio
 import tqdm
+from sklearn.metrics import silhouette_score
 
 from sklearn.manifold import TSNE
 from torchvision.transforms import ToTensor, Resize
@@ -26,19 +27,13 @@ import gc
 
 import os
 from gymnasium.wrappers import RecordVideo
+from sklearn.decomposition import PCA
 
 # code should work on either, faster on gpu
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Using device: {device}")
 
 torch.autograd.set_detect_anomaly(True)
-
-# random seeds for reproducability
-# torch.manual_seed(0)
-# torch.cuda.manual_seed_all(0)
-# random.seed(0)
-# torch.backends.cudnn.deterministic = True
-# torch.backends.cudnn.benchmark = False
 
 now = datetime.now()
 timestamp = now.strftime("%d_%H%M%S")
@@ -164,7 +159,7 @@ class DRL:
                 new_skills = F.normalize(torch.randn(done_mask.sum(), n_skill, device=device), dim=1)
                 env_skills[done_mask] = new_skills
 
-        writer.add_scalar("stats/Rewards", total_rewards.mean().item() / self.n_steps, i)
+        writer.add_scalar("stats/Rewards", total_rewards.sum().item() / self.n_steps, i)
 
 def encode_state(state, encoder):
     if state.dim() == 4 and state.shape[1] == 3:
@@ -179,10 +174,34 @@ def encode_state(state, encoder):
     
     return features
 
+class Config():
+    def __init__(self, lambda_param, lambda_lr, alpha, q_lr, policy_lr, representation_lr, timestamp, epsilon):
+        self.lambda_param = lambda_param
+        self.lambda_lr = lambda_lr
+        self.alpha = alpha
+        self.q_lr = q_lr
+        self.policy_lr = policy_lr
+        self.representation_lr = representation_lr
+        self.epsilon = epsilon
+
+        folder = f'./model/{timestamp}'
+        os.makedirs(folder, exist_ok=True)
+
+        with open(os.path.join(folder, 'config.txt'), 'w') as f:
+            f.write(f'alpha: {self.alpha}\n')
+            f.write(f'lambda: {self.lambda_param}\n')
+            f.write(f'lambda_lr: {self.lambda_lr}\n')
+            f.write(f'q_lr: {self.q_lr}\n')
+            f.write(f'policy_lr: {self.policy_lr}\n')
+            f.write(f'representation_lr: {self.representation_lr}\n')
+            f.write(f'epsilon: {self.epsilon}\n')
+
+
 
 class SkillPolicy:
-    def __init__(self, n_obs, n_skills, n_actions, representation):
-        self.alpha = 1.5
+    def __init__(self, n_obs, n_skills, n_actions, representation, config):
+        self.alpha_start = config.alpha
+        self.alpha_end = config.alpha - (0.0001 * 551) # Ensuring that I get 0.0001 step down every epoch -- which isn't too much -- hopefully ideal
         self.n_actions = n_actions
         self.encoder = representation.encoder
         self.representation = representation
@@ -209,9 +228,9 @@ class SkillPolicy:
         self.q2_target_net = copy.deepcopy(self.q1_net).to(device)
 
         self.q_optimizer = Adam(
-            list(self.q1_net.parameters()) + list(self.q2_net.parameters()), lr=1e-4
+            list(self.q1_net.parameters()) + list(self.q2_net.parameters()), lr=config.q_lr
         )
-        self.policy_optimizer = Adam(self.policy.parameters(), lr=1e-4)
+        self.policy_optimizer = Adam(self.policy.parameters(), lr=config.policy_lr)
         self.gamma = 0.99
 
     def get_policy_distribution(self, states, skills):
@@ -235,7 +254,7 @@ class SkillPolicy:
             phi = self.representation.get_latent_representation(states)
             phi_next = self.representation.get_latent_representation(next_states)
 
-            delta_phi = phi - phi_next
+            delta_phi = phi - phi_next ## TODO: MEAN DELTA PHI IS ZERO?
             # skills = F.normalize(skills, p=2, dim=1)
 
             intrinsic_reward = torch.einsum('bi,bi->b', delta_phi, skills).unsqueeze(-1)
@@ -279,8 +298,11 @@ class SkillPolicy:
         return policy_loss
 
     def update(self, replay_buffer, i):
+      frac = min(i, 551) / float(551)
+      self.alpha = self.alpha_start + frac * (self.alpha_end - self.alpha_start)
+      writer.add_scalar("anneal/alpha", self.alpha, i)
 
-      for _ in range(10):
+      for _ in range(5):
         states, skills, actions, rewards, next_states, not_dones = replay_buffer.sample()
         # Compute Q-loss
         q_loss = self.get_q_loss(states, actions, rewards, next_states, not_dones, skills)
@@ -330,7 +352,7 @@ class CNNEncoder(nn.Module):
 
 
 class RepresentationFunction(nn.Module):
-    def __init__(self, n_obs, n_skill):
+    def __init__(self, n_obs, n_skill, config):
         super().__init__()
 
         self.representation_func = nn.Sequential(
@@ -342,10 +364,10 @@ class RepresentationFunction(nn.Module):
         ).to(device)
 
         self.encoder = CNNEncoder(out_dim=256)
-        self.optimizer = Adam(list(self.parameters()) + list(self.encoder.parameters()), lr=1e-4)
-        self.lambda_param = torch.tensor(0.05, requires_grad=True)
-        self.lambda_optimizer = Adam([self.lambda_param], lr=1e-4)
-        self.epsilon = 1.0
+        self.optimizer = Adam(list(self.parameters()) + list(self.encoder.parameters()), lr=config.representation_lr)
+        self.lambda_param = torch.tensor(config.lambda_param, requires_grad=True)
+        self.lambda_optimizer = Adam([self.lambda_param], lr=config.lambda_lr)
+        self.epsilon = config.epsilon
 
     def get_latent_representation(self, state, normalize=False):
         features = encode_state(state, self.encoder)
@@ -359,7 +381,7 @@ class RepresentationFunction(nn.Module):
         Updates the representation function φ and the Lagrange multiplier λ
         based on skill-consistency and distance constraints.
         """
-        for _ in range(10):
+        for _ in range(5):
 
           state, skill, action, reward, next_state, not_done  = replay_buffer.sample()
 
@@ -413,7 +435,7 @@ def compute_heatmap(frames, save_path):
     plt.savefig(save_path, bbox_inches='tight', pad_inches=0)
     plt.close()
 
-def visualize_representation(replay_buffer, representation, n_samples=1000, folder='.', n_skills=10):
+def visualize_representation(replay_buffer, representation, global_step, n_samples=1000, folder='.', n_skills=10):
     skill_data = []
     for skill_id in range(n_skills):
         samples = replay_buffer.sample_by_skill(skill_id, num_samples=max(int(n_samples/10), 100))
@@ -429,8 +451,24 @@ def visualize_representation(replay_buffer, representation, n_samples=1000, fold
         phis = representation.get_latent_representation(states).cpu().numpy()
         skill_ids_np = skill_ids.cpu().numpy()
 
-    tsne = TSNE(n_components=2, perplexity=10)
+    tsne = TSNE(n_components=2, perplexity=20)
     tsne_result = tsne.fit_transform(phis)
+
+    pca = PCA(n_components=2)
+    pca_result = pca.fit_transform(phis)
+
+    # Plot
+    plt.figure(figsize=(8, 6))
+    for skill_id in range(n_skills):
+        idx = skill_ids_np == skill_id
+        if not idx.any():
+            continue
+        plt.scatter(pca_result[idx, 0], pca_result[idx, 1], label=f'Skill {skill_id}', alpha=0.6)
+    plt.legend()
+    plt.title('PCA of Representation φ(s)')
+    plt.savefig(f"{folder}/pca_representation_pca.png")
+    plt.close()
+
 
     plt.figure(figsize=(8, 6))
     for skill_id in range(n_skills):
@@ -440,8 +478,12 @@ def visualize_representation(replay_buffer, representation, n_samples=1000, fold
         plt.scatter(tsne_result[idx, 0], tsne_result[idx, 1], label=f'Skill {skill_id}', alpha=0.6)
     plt.legend()
     plt.title('t-SNE of Representation φ(s)')
-    plt.savefig(f"{folder}/representation_tsne.png")
+    plt.savefig(f"{folder}/tsne_representation_tsne.png")
     plt.close()
+
+    if len(np.unique(skill_ids_np)) > 1:
+        sil_score = silhouette_score(phis, skill_ids_np)
+        writer.add_scalar("representation/silhouette_score", sil_score, global_step)
 
 
 def evaluate_skills(env_name, policy, representation, global_step, writer=None, n_skills=5, steps_per_skill=512, video_dir='skill_videos'):
@@ -465,6 +507,8 @@ def evaluate_skills(env_name, policy, representation, global_step, writer=None, 
         total_intrinsic_reward = 0
         step_count = 0
 
+        norms = []
+
         while step_count < steps_per_skill:
             with torch.no_grad():
                 action = policy.get_action(obs, skill, eval=True).item()
@@ -475,6 +519,7 @@ def evaluate_skills(env_name, policy, representation, global_step, writer=None, 
             # next_obs_tensor = torch.tensor(next_obs, dtype=torch.float32, device=device).view(1, -1)
             next_obs_tensor = torch.unsqueeze(torch.tensor(next_obs, dtype=torch.float32, device=device), 0).permute(0, 3, 1, 2) ## Encoding doesn't matter because get_latent_representation encodes
             delta_phi = representation.get_latent_representation(next_obs_tensor) - representation.get_latent_representation(obs)
+            norms.append(delta_phi.norm(dim=1))  
             intrinsic_reward = torch.einsum('bi,bi->b', delta_phi, skill).item()
             temp_buffer.store(obs, skill, torch.tensor([action]), torch.tensor([intrinsic_reward]), next_obs_tensor, torch.tensor([~(terminated or truncated)]))
             total_intrinsic_reward += intrinsic_reward
@@ -490,7 +535,8 @@ def evaluate_skills(env_name, policy, representation, global_step, writer=None, 
         video_path = os.path.join(video_dir, f"skill_{skill_id}.mp4")
         imageio.mimsave(video_path, frames, fps=30)
 
-        writer.add_scalar("representation/mean_delta_phi_norm", delta_phi.norm(dim=1).item(), global_step)
+        mean_norm = torch.cat(norms).mean().item()
+        writer.add_scalar("representation/mean_delta_phi_norm", mean_norm, global_step)
 
         heatmap_path = os.path.join(video_dir, f"skill_{skill_id}_heatmap.png")
         # compute_heatmap(frames, heatmap_path)
@@ -502,7 +548,19 @@ def evaluate_skills(env_name, policy, representation, global_step, writer=None, 
             writer.add_scalar(f"eval/intrinsic_reward_skill_{skill_id}", total_intrinsic_reward, global_step)
             writer.add_scalar(f"eval/episode_length_skill_{skill_id}", step_count, global_step)
     
-    visualize_representation(temp_buffer, representation, folder=video_dir, n_skills=n_skills)
+    visualize_representation(temp_buffer, representation, global_step, folder=video_dir, n_skills=n_skills)
+
+    ## Evaluate action distribution -- irrespective of the skill
+    states, skills, _, _, _, _ = temp_buffer.sample()
+    with torch.no_grad():
+        dist  = policy.get_policy_distribution(states, skills)
+        probs = dist.probs
+    mean_probs = probs.mean(dim=0)
+
+    for a in range(9): ## 9 actions in Ms. Pacman
+        writer.add_scalar(f"action_dist/action_{a}", mean_probs[a].item(), epoch)
+    writer.add_histogram("action_dist/all_actions", mean_probs.cpu().numpy(), epoch)
+
 
 
 if __name__ == "__main__":
@@ -512,8 +570,11 @@ if __name__ == "__main__":
     n_actions = env.action_space.n
     n_skill = 10 # 0 - NOOP, 1 - UP, 2 - LEFT, 3 - RIGHT, 4 - DOWN
 
-    representation = RepresentationFunction(n_obs, n_skill)
-    policy = SkillPolicy(n_obs, n_skill, n_actions, representation)
+    config = Config(lambda_param=0.2, lambda_lr=3e-5, alpha=0.8, q_lr=1e-4,\
+         policy_lr=5e-5, representation_lr=8e-5, timestamp=timestamp, epsilon=1.0)
+
+    representation = RepresentationFunction(n_obs, n_skill, config)
+    policy = SkillPolicy(n_obs, n_skill, n_actions, representation, config)
 
     start_epoch = 0
 
@@ -557,12 +618,6 @@ if __name__ == "__main__":
             ## EVALUATING SKILL
             evaluate_skills('ALE/MsPacman-v5', policy, representation,\
                  epoch, writer=writer, n_skills=n_skill, video_dir=f'{folder}/video_eval_{epoch}') ## ONLY doing for the first 3 skills
-
-            ## EVALUATING REPRESENTATION FUNCTION
-            # visualize_representation(replay_buffer=drl.replay_buffer,\
-            #      representation=representation, folder=f"{folder}/video_eval_{epoch}") ## DOING THIS IN SkILL EVALUATION WHICH DOES ONE HOT ENCODED SKILLS
-            # writer.add_image("eval/tSNE", \
-            #      torch.tensor(np.array(Image.open(f"{folder}/video_eval_{epoch}/representation_tsne.png"))).permute(2, 0, 1), epoch)
 
             gc.collect()
         cleanup_memory()
