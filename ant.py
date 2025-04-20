@@ -17,6 +17,7 @@ import torchvision.models as models
 
 import cv2
 import matplotlib.pyplot as plt
+import matplotlib.cm as cm
 import imageio
 import tqdm
 from sklearn.metrics import silhouette_score, davies_bouldin_score
@@ -33,6 +34,8 @@ import os
 from gymnasium.wrappers import RecordVideo
 from sklearn.decomposition import PCA
 
+import warnings
+
 # code should work on either, faster on gpu
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Using device: {device}")
@@ -41,10 +44,7 @@ torch.autograd.set_detect_anomaly(True)
 
 now = datetime.now()
 timestamp = now.strftime("%d_%H%M%S")
-writer = SummaryWriter(log_dir=f'runs/SAC-Discrete-{timestamp}')
-
-ale = ALEInterface()
-gym.register_envs(ale_py)
+writer = SummaryWriter(log_dir=f'runs/SAC-{timestamp}')
 
 METRICS = [
     "eval/mean_intrinsic_reward",
@@ -98,6 +98,7 @@ class Config():
             f.write(f'n_update_policy" {self.n_update_policy}\n')
             f.write(f'n_update_repr: {self.n_update_repr}\n')
 
+visited_bins = set()
 
 def cleanup_memory():
     gc.collect()  # Clean up CPU memory
@@ -105,47 +106,11 @@ def cleanup_memory():
         torch.cuda.empty_cache()            # Release cached GPU memory (PyTorch only)
         torch.cuda.ipc_collect()            # Clean up interprocess memory (multi-GPU safe)
 
-import warnings
-
-
-import torchvision.models as models
-import torch.nn as nn
-import torch.nn.functional as F
-import torch
-
-class PretrainedResNetEncoder(nn.Module):
-    def __init__(self, out_dim=256, freeze_base=True):
-        super().__init__()
-        resnet = models.resnet18(pretrained=True)
-
-        # Modify first layer to accept 3-channel input (RGB Atari)
-        resnet.conv1 = nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias=False)
-
-        # Truncate after last convolution
-        self.feature_extractor = nn.Sequential(*list(resnet.children())[:-1])  # [B, 512, 1, 1]
-
-        if freeze_base:
-            for param in self.feature_extractor.parameters():
-                param.requires_grad = False
-
-        self.fc = nn.Sequential(
-            nn.Flatten(),            # [B, 512]
-            nn.Linear(512, 256),
-            nn.ReLU(),
-            nn.Linear(256, out_dim)
-        )
-
-    def forward(self, x):
-        x = F.interpolate(x / 255.0, size=(224, 224))  # match ImageNet size
-        x = self.feature_extractor(x)
-        return self.fc(x)
-
-
 # @title Define Replay Buffer
 class ReplayBuffer:
     def __init__(self, capacity=100_000):
         self.buffer = deque(maxlen=capacity)
-        self.batch_size = 64
+        self.batch_size = 512
 
     def store(self, state, skill, action, reward, next_state, done):
         transitions = list(zip(state, skill, action, reward, next_state, 1 - torch.Tensor(done)))
@@ -184,20 +149,17 @@ class DRL:
         self.n_steps = 512
 
         self.envs = gym.vector.SyncVectorEnv(
-            [lambda: gym.make('ALE/MsPacman-v5') for _ in range(self.n_envs)])
+            [lambda: gym.make('Ant-v5') for _ in range(self.n_envs)])
 
         self.replay_buffer = ReplayBuffer(capacity=buffer_size)
 
-    def rollout(self, agent, i, n_skill, encoder):
+    def rollout(self, agent, i, n_skill):
         """Collect experience and store it in the replay buffer"""
 
         obs, _ = self.envs.reset()
         # obs = torch.tensor(obs, dtype=torch.float32, device=device).view(obs.shape[0], -1) ## CURRENTLY JUST FLATTENING, BUT CAN POTENTIALLY USE CNN TO EXTRACT FEATURES
-        obs = torch.tensor(obs, dtype=torch.float32, device=device).permute(0, 3, 1, 2)
-        enc_obs = encoder(obs)
-
-        # Sample a skill per environment (shape: [n_envs, skill_dim]) 
-        # skills = torch.rand(self.n_envs, n_skill, device=device)
+        obs = torch.tensor(obs, dtype=torch.float32, device=device)
+        enc_obs = obs
 
         ## Sample a zero centered one hot skill 
         one_hot = torch.eye(n_skill, device=device)  # shape (n_skills, n_skills)
@@ -216,7 +178,7 @@ class DRL:
                 actions = agent.get_action(enc_obs, skills)
 
             next_obs, rewards, dones, truncateds, _ = self.envs.step(actions.cpu().numpy())
-            next_obs = torch.tensor(next_obs, dtype=torch.float32, device=device).permute(0, 3, 1, 2)
+            next_obs = torch.tensor(next_obs, dtype=torch.float32, device=device)
             rewards = torch.tensor(rewards, dtype=torch.float32, device=device)
             not_done = ~(dones | truncateds)
 
@@ -227,80 +189,30 @@ class DRL:
         writer.add_scalar("stats/Rewards", total_rewards.mean().item() / self.n_steps, i)
 
 
-    # def rollout(self, agent, i, n_skill, encoder):
-    #     obs, _ = self.envs.reset()
-    #     obs = torch.tensor(obs, dtype=torch.float32, device=device).permute(0, 3, 1, 2)
-    #     enc_obs = encoder(obs)
-
-    #     # Initialize skill vector for each environment
-    #     # env_skills = torch.eye(n_skill)[torch.randint(0, n_skill, (self.n_envs,))].to(device)  # shape: (n_envs, n_skill)
-    #     env_skills = F.normalize(torch.randn(self.n_envs, n_skill, device=device), dim=1)  # shape: (n_envs, n_skill)
-    #     total_rewards = torch.zeros(self.n_envs, device=device)
-
-    #     for step_num in range(self.n_steps):
-    #         with torch.no_grad():
-    #             actions = agent.get_action(enc_obs, env_skills)
-
-    #         next_obs, rewards, dones, truncateds, _ = self.envs.step(actions.cpu().numpy())
-    #         next_obs = torch.tensor(next_obs, dtype=torch.float32, device=device).permute(0, 3, 1, 2)
-    #         rewards = torch.tensor(rewards, dtype=torch.float32, device=device)
-    #         not_done = ~(dones | truncateds)
-
-    #         # Store the transitions
-    #         self.replay_buffer.store(obs, env_skills, actions, rewards, next_obs, not_done)
-    #         obs = next_obs
-    #         enc_obs = encoder(obs)
-    #         total_rewards += rewards
-
-    #         # Resample skills only for environments where episode ended
-    #         done_mask = dones | truncateds
-    #         if done_mask.any(): ## RESAMPLING SKILLS QUITE A LOT :)
-    #             new_skills = F.normalize(torch.randn(done_mask.sum(), n_skill, device=device), dim=1)
-    #             env_skills[done_mask] = new_skills
-
-    #     writer.add_scalar("stats/Rewards", total_rewards.sum().item() / self.n_steps, i)
-
-def encode_state(state, encoder):
-    if state.dim() == 4 and state.shape[1] == 3:
-        features = encoder(state)
-    elif state.dim() == 3 and state.shape[0] == 3:
-        state = state.unsqueeze(0)
-        features = encoder(state)
-    elif state.dim() == 2:
-        features = state
-    else:
-        raise ValueError(f'found a state with shape: {state.shape} in get_latent_representationss')
-    
-    return features
-
 class SkillQNet(nn.Module):
-    def __init__(self, obs_dim, skill_dim, n_actions, hidden_dim=512):
+    def __init__(self, obs_dim, skill_dim, action_dim, hidden_dim=256):
         super().__init__()
-        self.fc1 = nn.Linear(obs_dim + skill_dim, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim + skill_dim, hidden_dim)
-        self.fc3 = nn.Linear(hidden_dim, hidden_dim // 2)
-        self.out = nn.Linear(hidden_dim // 2, n_actions)
-        self.skill_scale = 3.0
+        self.fc = nn.Sequential(
+            nn.Linear(obs_dim + skill_dim + action_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1)
+        )
 
-    def forward(self, obs, skill):
-        skill = torch.tanh(skill * self.skill_scale)
-        x = torch.cat([obs, skill], dim=-1)
-        x = F.silu(self.fc1(x))
-        x = torch.cat([x, skill], dim=-1)  # skip connection
-        x = F.silu(self.fc2(x))
-        x = F.silu(self.fc3(x))
-        return self.out(x)  # [B, n_actions]
+    def forward(self, obs, skill, action):
+        x = torch.cat([obs, skill, action], dim=-1)
+        return self.fc(x)
 
 class SkillPolicy:
     def __init__(self, n_obs, n_skills, n_actions, representation, config):
         self.alpha_start = config.alpha
         self.alpha_end = config.alpha - (0.001 * 551) # Ensuring that I get 0.0001 step down every epoch -- which isn't too much -- hopefully ideal
         self.n_actions = n_actions
-        self.encoder = representation.encoder
         self.representation = representation
         self.n_step_update = config.n_update_policy
 
-        self.policy = SkillPolicyNet(obs_dim=n_obs, skill_dim=n_skills, n_actions=n_actions).to(device)
+        self.policy = GaussianSkillPolicyNet(obs_dim=n_obs, skill_dim=n_skills, action_dim=n_actions).to(device)
 
         self.q1_net = SkillQNet(n_obs, n_skills, n_actions).to(device)
         self.q2_net = SkillQNet(n_obs, n_skills, n_actions).to(device)
@@ -314,64 +226,68 @@ class SkillPolicy:
         self.gamma = 0.99
 
     def get_policy_distribution(self, states, skills):
-        states = encode_state(states, self.encoder)
-        logits = self.policy(states, skills)
-        return Categorical(logits=logits)
+        mean, std = self.policy(states, skills)
+        dist = torch.distributions.Normal(mean, std)
+        return dist
+
+
+    def sample_action(self, mean, std):
+        normal = torch.distributions.Normal(mean, std)
+        x_t = normal.rsample()
+        y_t = torch.tanh(x_t)
+        action = y_t
+        log_prob = normal.log_prob(x_t) - torch.log(1 - y_t.pow(2) + 1e-6)
+        return action, log_prob.sum(dim=-1, keepdim=True)
 
     def get_action(self, states, skills, eval=False):
-        dist = self.get_policy_distribution(states, skills)
+        mean, std = self.policy(states, skills)
         if eval:
-            return torch.argmax(dist.probs, dim=-1)
-        return dist.sample()
+            return torch.tanh(mean)
+        action, _ = self.sample_action(mean, std)
+        return action
+
 
     def get_q_loss(self, states, actions, rewards, next_states, not_dones, skills):
         with torch.no_grad():
             phi = self.representation.get_latent_representation(states)
             phi_next = self.representation.get_latent_representation(next_states)
-
             delta_phi = phi_next - phi
-
             intrinsic_reward = torch.einsum('bi,bi->b', delta_phi, skills).unsqueeze(-1)
-            not_dones = not_dones.unsqueeze(-1)
 
-            next_states = encode_state(next_states, self.encoder)
-            next_q1 = self.q1_target_net(next_states, skills)
-            next_q2 = self.q2_target_net(next_states, skills)
-            next_q = torch.min(next_q1, next_q2)
+            next_states_encoded = next_states
+            mean, std = self.policy(next_states_encoded, skills)
+            next_action, log_prob = self.sample_action(mean, std)
 
-            next_pi = self.get_policy_distribution(next_states, skills)
-            log_probs = next_pi.logits.log_softmax(dim=-1)
-            next_q_val = (next_pi.probs * (next_q - self.alpha * log_probs)).sum(dim=-1, keepdim=True)
-            # print(f'intrinsic_reward.shape: {intrinsic_reward.shape}, next_q_val.shape: {next_q_val.shape}, not_dones.shape: {not_dones.shape}')
-            q_target = 10 * intrinsic_reward + self.gamma * not_dones * next_q_val
+            target_q1 = self.q1_target_net(next_states_encoded, skills, next_action)
+            target_q2 = self.q2_target_net(next_states_encoded, skills, next_action)
+            target_q = torch.min(target_q1, target_q2) - self.alpha * log_prob
 
-        states = encode_state(states, self.encoder)
+            q_target = 10 * intrinsic_reward + self.gamma * not_dones.unsqueeze(-1) * target_q
 
-        q1 = self.q1_net(states, skills).gather(1, actions.long().unsqueeze(-1))
-        q2 = self.q2_net(states, skills).gather(1, actions.long().unsqueeze(-1))
+        states_encoded = states
+        q1 = self.q1_net(states_encoded, skills, actions)
+        q2 = self.q2_net(states_encoded, skills, actions)
+        return F.mse_loss(q1, q_target) + F.mse_loss(q2, q_target)
 
-        # print(f'q1.shape: {q1.shape}, q_targte.shpae; {q_target.shape}, q2.shape: {q2.shape}')
-
-        loss = F.mse_loss(q1, q_target) + F.mse_loss(q2, q_target)
-        return loss
 
     def get_policy_loss(self, states, skills):
-        dist = self.get_policy_distribution(states, skills)
-        probs = dist.probs
-        log_probs = dist.logits.log_softmax(dim=-1)
-
-        states = encode_state(states, self.encoder)
-
-        q1 = self.q1_net(states, skills)
-        q2 = self.q2_net(states, skills)
+        states_encoded = states
+        mean, std = self.policy(states_encoded, skills)
+        action, log_prob = self.sample_action(mean, std)
+        
+        q1 = self.q1_net(states_encoded, skills, action)
+        q2 = self.q2_net(states_encoded, skills, action)
         q = torch.min(q1, q2)
 
-        policy_loss = -(probs * (q - self.alpha * log_probs)).sum(dim=1).mean()
-        return policy_loss
+        return (self.alpha * log_prob - q).mean()
+
 
     def get_entropy(self, states, skills):
-        dist = self.get_policy_distribution(states, skills)
-        return dist.entropy()
+        mean, std = self.policy(states, skills)
+        dist = torch.distributions.Normal(mean, std)
+        entropy = dist.entropy().sum(dim=-1)  # sum over action dimensions
+        return entropy
+
 
     def update(self, replay_buffer, i):
       frac = min(i, 551) / float(551)
@@ -406,201 +322,27 @@ class SkillPolicy:
         for target_param, param in zip(target.parameters(), source.parameters()):
             target_param.data.copy_(tau * param.data + (1.0 - tau) * target_param.data)
 
-# def get_ghost_locations(obs):
-#     bad_ghosts = [198, 200, 180, 84]
-#     ghost_locs = []
-#     for ghost in bad_ghosts:
-#         rows, cols = np.where(obs[:, :, 0] == 198)
-#         if len(rows) > 0 and len(cols) > 0:
-#             top = np.min(rows)
-#             bottom = np.max(rows)
-#             left = np.min(cols)
-#             right = np.max(cols)
-            
-#         if len(rows) > 0:
-#             ghost_y = np.mean(rows)
-#             ghost_x = np.mean(cols)
-#         else:
-#             ghost_x, ghost_y = 0.0, 0.0
-        
-#         ghost_locs.append(ghost_x)
-#         ghost_locs.append(ghost_y)
-    
-#     while len(ghost_locs) < 8:
-#         ghost_locs.append(0.0)
-    
-#     hsv = cv2.cvtColor(obs, cv2.COLOR_BGR2HSV)
-#     mask = cv2.inRange(hsv, np.array([11, 168, 194]), np.array([11, 168, 194]))  # Binary image
-#     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-#     for cnt in contours:
-#         if cv2.contourArea(cnt) < 10:  # filter noise
-#             continue
-
-#         x, y, w, h = cv2.boundingRect(cnt)
-#         cx = x + w // 2
-#         cy = y + h // 2
-#         ghost_locs.append(cx)
-#         ghost_locs.append(cy)
-
-#     while len(ghost_locs) < 16:
-#         ghost_locs.append(0.0)
-
-#     return ghost_locs
-
-# def get_pacman_location(obs):
-#     lower_yellow = np.array([20, 100, 100])
-#     upper_yellow = np.array([30, 255, 255])
-#     hsv = cv2.cvtColor(obs, cv2.COLOR_RGB2HSV)
-#     mask = cv2.inRange(hsv, lower_yellow, upper_yellow)  # Binary image
-#     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-#     num_lives = -1
-#     ghost_loc = None
-#     for cnt in contours:
-#         if cv2.contourArea(cnt) < 10:  # filter noise
-#             continue
-
-#         x, y, w, h = cv2.boundingRect(cnt)
-#         cx = x + w // 2
-#         cy = y + h // 2
-#         num_lives += 1
-
-#         if cy != 178:
-#             ghost_loc = [cx, cy]
-
-#     if ghost_loc is None:
-#         warnings.warn(f"Couldn't find pacman location while encoding", category=UserWarning)
-#         return ([0, 0], 0)
-    
-#     return (ghost_loc, num_lives)
-
-# def get_score_from_frame(frame):
-#     obs = frame[182: , :, :]
-#     gray = cv2.cvtColor(obs, cv2.COLOR_BGR2GRAY)
-#     gray = (gray * 255).astype('uint8')
-#     _, thresh = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
-
-#     # # Optional: resize for better OCR accuracy
-#     thresh = cv2.resize(thresh, None, fx=2, fy=2, interpolation=cv2.INTER_LINEAR)
-
-#     # # Run OCR using pytesseract
-#     custom_config = r'--oem 3 --psm 6 outputbase digits'
-#     text = pytesseract.image_to_string(thresh, config=custom_config)
-
-#     # # Extract only numbers
-#     numbers = re.findall(r'\d+', text)
-#     if len(numbers) == 0:
-#         return 0
-#     else:
-#         return int(numbers[0])
-
-# class CNNEncoder(nn.Module):
-#     def __init__(self, out_dim):
-#         super().__init__()
-#         self.conv = nn.Sequential(
-#             nn.Conv2d(3, 32, kernel_size=8, stride=4),  # (3, 210, 160) → (32, 52, 39)
-#             nn.ReLU(),
-#             nn.Dropout(),
-#             nn.Conv2d(32, 64, kernel_size=4, stride=2), # → (64, 25, 18)
-#             nn.ReLU(),
-#             nn.Dropout(),
-#             nn.Conv2d(64, 64, kernel_size=3, stride=1), # → (64, 23, 16)
-#             nn.ReLU()
-#         ).to(device)
-#         self.fc = nn.Sequential(
-#             nn.Linear(64 * 22 * 16 + 20, 8192),
-#             nn.ReLU(),
-#             nn.Linear(8192, 2048),
-#             nn.ReLU(),
-#             nn.Linear(2048, 512),
-#             nn.ReLU(),
-#             nn.Linear(512, out_dim),
-#         ).to(device)
-
-#     def forward(self, x):
-#         B = x.size(0)
-        
-#         manual_features = []
-
-#         for i in range(B):
-#             with torch.no_grad():
-#                 np_x = x[i].cpu().numpy()
-#                 np_x = np.transpose(np_x, (1, 2, 0))
-#                 np_x = np_x.astype(np.uint8)
-#                 ghost_locs = get_ghost_locations(np_x) # Length 16
-#                 pacman_loc, lives = get_pacman_location(np_x) # Length 2
-#                 current_score = get_score_from_frame(np_x)
-            
-#             feats = pacman_loc.copy()
-#             feats.extend(ghost_locs)
-#             feats.append(current_score)
-#             feats.append(lives) ## Length of feats is 20
-
-#             manual_features.append(feats)
-
-#         manual_tensor = torch.tensor(manual_features, dtype=torch.float32, device=x.device)
-
-#         cnn_features = self.conv(x / 255.0)
-#         cnn_flat = cnn_features.reshape(B, -1) # You cannot use view here because dropout made it non contiguous
-
-#         combined = torch.cat([cnn_flat, manual_tensor], dim=1)  
-
-#         out = self.fc(combined)
-#         return out
-
-class CNNEncoder(nn.Module):
-    def __init__(self, out_dim):
-        super().__init__()
-        self.conv = nn.Sequential(
-            nn.Conv2d(3, 32, kernel_size=8, stride=4),
-            nn.ReLU(),
-            nn.BatchNorm2d(32),
-            nn.Conv2d(32, 64, kernel_size=4, stride=2),
-            nn.ReLU(),
-            nn.BatchNorm2d(64),
-            nn.Conv2d(64, 64, kernel_size=3, stride=1),
-            nn.ReLU(),
-            nn.BatchNorm2d(64),
-        ).to(device)
-        self.fc = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(64, 512),
-            nn.ReLU(),
-            nn.Linear(512, out_dim),
-        ).to(device)
-        self.conv_out = nn.AdaptiveAvgPool2d((1, 1))
-
-
-    def forward(self, x):
-        cnn_features = self.conv(x / 255.0)
-        pooled = self.conv_out(cnn_features)
-        return self.fc(pooled)
-
 
 class RepresentationFunction(nn.Module):
     def __init__(self, n_obs, n_skill, config):
         super().__init__()
 
         self.representation_func = nn.Sequential(
-            nn.Linear(n_obs, 128),
+            nn.Linear(n_obs, 1024),
             nn.ReLU(),
-            nn.Linear(128, 64),
+            nn.Linear(1024, 1024),
             nn.ReLU(),
-            nn.Linear(64, n_skill)
+            nn.Linear(1024, n_skill)
         ).to(device)
 
-        # self.encoder = CNNEncoder(out_dim=256)
-        self.encoder = PretrainedResNetEncoder(out_dim=256).to(device)
-        self.optimizer = Adam(list(self.parameters()) + list(self.encoder.parameters()), lr=config.representation_lr)
+        self.optimizer = Adam(list(self.parameters()), lr=config.representation_lr)
         self.lambda_param = torch.tensor(config.lambda_param, requires_grad=True)
         self.lambda_optimizer = Adam([self.lambda_param], lr=config.lambda_lr)
         self.epsilon = config.epsilon
         self.update_steps = config.n_update_repr
 
-    def get_latent_representation(self, state, normalize=False):
-        features = encode_state(state, self.encoder)
-        x = self.representation_func(features)
+    def get_latent_representation(self, state, normalize=True):
+        x = self.representation_func(state)
         if normalize:
             return F.normalize(x, p=2, dim=1)
         return x
@@ -642,24 +384,6 @@ class RepresentationFunction(nn.Module):
 
         writer.add_scalar("loss/representation_loss", representation_loss.item(), i)
         writer.add_scalar("loss/  lambda_loss", lambda_loss.item(), i)
-
-
-def compute_heatmap(frames, save_path):
-    heatmap = None
-    for frame in frames:
-        gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
-        # naive thresholding to isolate the player
-        _, thresh = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY)
-        if heatmap is None:
-            heatmap = np.zeros_like(thresh, dtype=np.float32)
-        heatmap += thresh.astype(np.float32)
-
-    # Normalize and save heatmap
-    plt.figure(figsize=(6, 6))
-    plt.imshow(heatmap, cmap='hot', interpolation='nearest')
-    plt.axis('off')
-    plt.savefig(save_path, bbox_inches='tight', pad_inches=0)
-    plt.close()
 
 def visualize_representation(replay_buffer, representation, global_step, n_samples=1000, folder='.', n_skills=10):
     skill_data = []
@@ -718,12 +442,12 @@ def visualize_representation(replay_buffer, representation, global_step, n_sampl
 
 def evaluate_skills(env_name, policy, representation, global_step, writer=None, n_skills=5, steps_per_skill=512, video_dir='skill_videos'):
     os.makedirs(video_dir, exist_ok=True)
+    trajectories = {skill_id: [] for skill_id in range(n_skills)}
 
     temp_buffer = ReplayBuffer(capacity=steps_per_skill * n_skills)
     temp_buffer.batch_size = 512
 
     mean_intrinsic_reward = []
-    big_vs = set()
     norms = []
     mean_episode_length = []
 
@@ -733,32 +457,41 @@ def evaluate_skills(env_name, policy, representation, global_step, writer=None, 
 
     for skill_id in range(n_skills): # For every z vector, I will perform ONLY the action related to that skill and get the reward
         env = gym.make(env_name, render_mode='rgb_array')
+        positions = []
+
         obs, _ = env.reset()
-        obs = torch.unsqueeze(torch.tensor(obs, dtype=torch.float32, device=device), 0).permute(0, 3, 1, 2)
+        obs = torch.unsqueeze(torch.tensor(obs, dtype=torch.float32, device=device), 0)
 
         # USING ONE HOT ENCODED SKILLS HERE SO THAT WE CAN FIND THE DIFFERENT SKILLS SEPARATELY
         skill = zero_centered[skill_id].unsqueeze(0)
 
-        # frames = []
-        vs = set()
+        frames = []
         total_intrinsic_reward = 0
         step_count = 0
         print(f'evaluating skill {skill_id}')
 
         while step_count < steps_per_skill:
             with torch.no_grad():
-                action = policy.get_action(obs, skill, eval=True).item()
+                action = policy.get_action(obs, skill, eval=True).squeeze(0).cpu().numpy()
             next_obs, _, terminated, truncated, _ = env.step(action)
-            # frame = env.render()
-            vs.add(hash(next_obs.tobytes()))
+            phi = representation.get_latent_representation(obs)
+            for vec in phi:
+                visited_bins.add(get_state_bin(vec))
+
+            pos = next_obs[:2]  # use [0] if only X
+            positions.append(pos)
+            trajectories[skill_id].append(np.array(positions))  # store this seed's path for this skill
 
             # next_obs_tensor = torch.tensor(next_obs, dtype=torch.float32, device=device).view(1, -1)
-            next_obs_tensor = torch.unsqueeze(torch.tensor(next_obs, dtype=torch.float32, device=device), 0).permute(0, 3, 1, 2) ## Encoding doesn't matter because get_latent_representation encodes
+            next_obs_tensor = torch.unsqueeze(torch.tensor(next_obs, dtype=torch.float32, device=device), 0) ## Encoding doesn't matter because get_latent_representation encodes
             delta_phi = representation.get_latent_representation(next_obs_tensor) - representation.get_latent_representation(obs)
             norms.append(delta_phi.norm(dim=1))  
             intrinsic_reward = torch.einsum('bi,bi->b', delta_phi, skill).item()
-            # frames.append(frame)
+
+            frame = env.render()
+            frames.append(frame)
             temp_buffer.store(obs, skill, torch.tensor([action]), torch.tensor([intrinsic_reward]), next_obs_tensor, torch.tensor([~(terminated or truncated)]))
+
             total_intrinsic_reward += intrinsic_reward
 
             if terminated or truncated:
@@ -769,25 +502,44 @@ def evaluate_skills(env_name, policy, representation, global_step, writer=None, 
 
         env.close()
 
-        # video_path = os.path.join(video_dir, f"skill_{skill_id}.mp4")
-        # imageio.mimsave(video_path, frames, fps=30)
+        video_path = os.path.join(video_dir, f"skill_{skill_id}.mp4")
+        imageio.mimsave(video_path, frames, fps=30)
 
-        # del frames
+        del frames
         torch.cuda.empty_cache() 
         mean_intrinsic_reward.append(total_intrinsic_reward)
-        big_vs.update(vs)
         mean_episode_length.append(step_count)
         # print(f"Skill {skill_id}: steps = {step_count}, intrinsic reward = {total_intrinsic_reward:.2f}, saved to {video_path}")
         if writer:
             writer.add_scalar(f"eval/intrinsic_reward_skill_{skill_id}", total_intrinsic_reward, global_step)
             writer.add_scalar(f"eval/episode_length_skill_{skill_id}", step_count, global_step)
-            writer.add_scalar(f"eval/state_coverage_skill_{skill_id}", len(vs), global_step)
+    
+    colors = plt.cm.get_cmap("tab10", n_skills)
 
-    writer.add_scalar(f"eval/total_state_coverage", len(big_vs), global_step)
-    del big_vs
+    colors = cm.get_cmap("tab10", n_skills)
+    plt.figure(figsize=(8, 6))
+    for skill_id, traj_list in trajectories.items():
+        # Flatten and concatenate all trajectories for this skill
+        all_positions = np.concatenate(traj_list, axis=0)  # shape: (total_steps, 2)
+        plt.plot(all_positions[:, 0], all_positions[:, 1], color=colors(skill_id), label=f'Skill {skill_id}', alpha=0.6)
+
+    # Add legend
+    handles, labels = plt.gca().get_legend_handles_labels()
+    by_label = dict(zip(labels, handles))
+    plt.legend(by_label.values(), by_label.keys())
+
+    plt.title("Ant-v5: X-Y Trajectories Colored by Skill (across seeds)")
+    plt.xlabel("X")
+    plt.ylabel("Y")
+    plt.grid(True)
+    plt.savefig(f"{video_dir}/ant_trajectory_all_skills.png")
+    plt.close()
+
+
 
     mean_norm = torch.cat(norms).mean().item()
     writer.add_scalar("representation/mean_delta_phi_norm", mean_norm, global_step)
+    writer.add_scalar("eval/total_state_coverage_bins", len(visited_bins), global_step)
 
     mean_intrinsic_reward = sum(mean_intrinsic_reward) / n_skills
     mean_episode_length = sum(mean_episode_length) / n_skills
@@ -796,89 +548,49 @@ def evaluate_skills(env_name, policy, representation, global_step, writer=None, 
     writer.add_scalar(f"eval/mean_episode_length", mean_episode_length, global_step)
     
     visualize_representation(temp_buffer, representation, global_step, folder=video_dir, n_skills=n_skills)
-    plot_skill_action_distributions(policy, temp_buffer, n_skills, 9, save_path=f"{video_dir}/skill_action_distribution.png")
-    # check_skill_conditioned_policy(temp_buffer, n_skills, policy)
+    # plot_skill_action_distributions(policy, temp_buffer, n_skills, 9, save_path=f"{video_dir}/skill_action_distribution.png")
 
-    ## Evaluate action distribution -- irrespective of the skill
-    # states, skills, _, _, _, _ = temp_buffer.sample()
-    # with torch.no_grad():
-    #     dist  = policy.get_policy_distribution(states, skills)
-    #     probs = dist.probs
-    # mean_probs = probs.mean(dim=0)
-
-    # for a in range(9): ## 9 actions in Ms. Pacman
-    #     writer.add_scalar(f"action_dist/action_{a}", mean_probs[a].item(), epoch)
-    # writer.add_histogram("action_dist/all_actions", mean_probs.cpu().numpy(), epoch)
-
-class SkillPolicyNet(nn.Module):
-    def __init__(self, obs_dim, skill_dim, n_actions):
+class GaussianSkillPolicyNet(nn.Module):
+    def __init__(self, obs_dim, skill_dim, action_dim):
         super().__init__()
-        self.fc1 = nn.Linear(obs_dim + skill_dim, 512)
-        self.fc2 = nn.Linear(512 + skill_dim, 256)
-        self.fc3 = nn.Linear(256, 128)
-        self.out = nn.Linear(128, n_actions)
+        self.fc = nn.Sequential(
+            nn.Linear(obs_dim + skill_dim, 256),
+            nn.ReLU(),
+            nn.Linear(256, 256),
+            nn.ReLU()
+        )
+        self.mean = nn.Linear(256, action_dim)
+        self.log_std = nn.Linear(256, action_dim)
         self.skill_scale = 5
 
     def forward(self, obs, skill):
         skill = torch.tanh(skill * self.skill_scale)
         x = torch.cat([obs, skill], dim=-1)
-        x = F.tanh(self.fc1(x))
-        x = torch.cat([x, skill], dim=-1)  # reinforce skill injection
-        x = F.tanh(self.fc2(x))
-        x = F.tanh(self.fc3(x))
-        return self.out(x)
+        x = self.fc(x)
+        mean = self.mean(x)
+        log_std = self.log_std(x).clamp(-20, 2)
+        std = torch.exp(log_std)
+        return mean, std
+
+def get_state_bin(phi, bin_size=0.1):
+    """Discretize latent state into a tuple key using fixed-size bins."""
+    return tuple((phi / bin_size).floor().int().tolist())
 
 
-def plot_skill_action_distributions(policy, replay_buffer, n_skills, n_actions, save_path="skill_action_distribution.png"):
-    fig, axes = plt.subplots(nrows=n_skills, ncols=1, figsize=(8, 3 * n_skills), sharex=True)
 
-    for skill_id in range(n_skills):
-        try:
-            states, skills, *_ = replay_buffer.sample_by_skill(skill_id, num_samples=512)
-        except Exception as e:
-            print(f"Skipping skill {skill_id}: {e}")
-            continue
-
-        with torch.no_grad():
-            dist = policy.get_policy_distribution(states, skills)
-            mean_probs = dist.probs.mean(dim=0).cpu().numpy()
-
-        ax = axes[skill_id] if n_skills > 1 else axes
-        ax.bar(range(n_actions), mean_probs)
-        ax.set_ylim(0, 1)
-        ax.set_title(f"Skill {skill_id}")
-        ax.set_ylabel("P(a)")
-        ax.set_xlabel("Action")
-
-    plt.tight_layout()
-    os.makedirs(os.path.dirname(save_path), exist_ok=True)
-    plt.savefig(save_path)
-    plt.close()
-    print(f"Saved action distribution plot to {save_path}")
-
-# def check_skill_conditioned_policy(replay_buffer, n_skills, policy):
-#     state = replay_buffer.sample()[0][0:1]  # shape [1, obs_dim]
-#     one_hot = torch.eye(n_skills, device=device)  # shape (n_skills, n_skills)
-#     mean = one_hot.mean(dim=0, keepdim=True)
-#     zero_centered = one_hot - mean  # subtract mean from each row
-#     for skill_id in range(n_skills):
-#         z = zero_centered[skill_id].unsqueeze(0)
-#         dist = policy.get_policy_distribution(state, z)
-#         print(f"Skill {skill_id}: {dist.probs.detach().cpu().numpy()}")
 
 
 
 if __name__ == "__main__":
-    env = gym.make('ALE/MsPacman-v5')
-    # n_obs = env.observation_space.shape[0] * env.observation_space.shape[1] * env.observation_space.shape[2]
-    n_obs = 256 # Encoded dimension
-    n_actions = env.action_space.n
+    env = gym.make('Ant-v5', ctrl_cost_weight=0.5)
+    n_obs = env.observation_space.shape[0]
+    n_actions = 8 # actually action_dim now
 
-    config = Config(lambda_param=0.001, lambda_lr=8e-5, alpha=0.45, q_lr=1e-4,\
-         policy_lr=1e-4, representation_lr=8e-5, timestamp=timestamp, epsilon=0.8, n_skill=4,
-         warmup_epochs=0, n_update_policy=40, n_update_repr=40)
+    config = Config(lambda_param=30.0, lambda_lr=1e-4, alpha=0.1, q_lr=1e-4,\
+         policy_lr=1e-4, representation_lr=1e-4, timestamp=timestamp, epsilon=1e-3, n_skill=8,
+         warmup_epochs=0, n_update_policy=50, n_update_repr=50)
     
-    n_skill = config.n_skill # 0 - NOOP, 1 - UP, 2 - LEFT, 3 - RIGHT, 4 - DOWN
+    n_skill = config.n_skill
 
     hparam_dict = {h.name: getattr(config, h.name) for h in HPARAMS.values()}
     writer.add_hparams(hparam_dict, {m: 0 for m in METRICS})  # placeholders -- metrics will get updated by scalars that will be added later
@@ -914,21 +626,21 @@ if __name__ == "__main__":
 
     drl = DRL(buffer_size = 10_000)
 
-    if not os.path.exists(f"./model/{timestamp}"):
-        os.makedirs(f"./model/{timestamp}")
+    if not os.path.exists(f"./model/SAC/{timestamp}"):
+        os.makedirs(f"./model/SAC/{timestamp}")
 
-    folder = f'./model/{timestamp}'
+    folder = f'./model/SAC/{timestamp}'
 
     for epoch in range(start_epoch, num_epochs + start_epoch):
         print(f'EPOCH: {epoch}')
-        drl.rollout(policy, epoch, n_skill, representation.encoder)
+        drl.rollout(policy, epoch, n_skill)
         representation.update(drl.replay_buffer, epoch)
 
         if epoch >= config.warmup_epochs:
             policy.update(drl.replay_buffer, epoch)
         if epoch % 10 == 0:
             ## EVALUATING SKILL
-            evaluate_skills('ALE/MsPacman-v5', policy, representation,\
+            evaluate_skills('Ant-v5', policy, representation,\
                  epoch, writer=writer, n_skills=n_skill, video_dir=f'{folder}/video_eval_{epoch}') ## ONLY doing for the first 3 skills
 
             gc.collect()
@@ -948,4 +660,4 @@ if __name__ == "__main__":
         'representation_optimizer_state_dict': representation.optimizer.state_dict(),
         'lambda_param': representation.lambda_param.detach().item(),
         'lambda_optimizer_state_dict': representation.lambda_optimizer.state_dict(),
-    }, f"./model/{timestamp}/checkpoint.pth")
+    }, f"./model/SAC/{timestamp}/checkpoint.pth")
