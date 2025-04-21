@@ -20,3 +20,4 @@ You can look at the tensorboard logs that support the argument in report. Specif
 3. `runs/SAC-Discrete-20_114556`: Mean $\Delta \phi$ in original architecture
 4. `runs/SAC-Discrete-20_165643`: Mean $\Delta \phi$ in ResNet backboned architecture
 
+drl.ipynb contains code for additional experiments with the entropy loss, experiments with a different rollout policy, and experiments with the complexity of the skill dimensions and distribution. Associated runs + videos + tensorboard snapshots can be found at https://drive.google.com/drive/folders/1YT7w6mKUSjMqVTBrj8OtQj_f8QOPlGw5?usp=share_link 
